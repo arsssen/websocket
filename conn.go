@@ -21,6 +21,7 @@ const (
 	maxControlFramePayloadSize = 125
 	finalBit                   = 1 << 7
 	maskBit                    = 1 << 7
+	compressionBit             = 1 << 6 // used in flushFrame on writes
 	writeWait                  = time.Second
 
 	defaultReadBufferSize  = 4096
@@ -54,6 +55,10 @@ const (
 
 	// BinaryMessage denotes a binary data message.
 	BinaryMessage = 2
+
+	// Internally created types for compression.
+	CompressedTextMessage   = 3
+	CompressedBinaryMessage = 4
 
 	// CloseMessage denotes a close control message. The optional message
 	// payload contains a numeric code and text. Use the FormatCloseMessage
@@ -122,7 +127,8 @@ func isControl(frameType int) bool {
 }
 
 func isData(frameType int) bool {
-	return frameType == TextMessage || frameType == BinaryMessage
+	return frameType == TextMessage || frameType == BinaryMessage ||
+		frameType == CompressedTextMessage || frameType == CompressedBinaryMessage
 }
 
 func maskBytes(key [4]byte, pos int, b []byte) int {
@@ -143,6 +149,8 @@ type Conn struct {
 	conn        net.Conn
 	isServer    bool
 	subprotocol string
+
+	compression string // type of compression. len > 0 means it's enabled
 
 	// Write fields
 	mu        chan bool // used as mutex to protect write to conn and closeSent
@@ -346,6 +354,11 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 	if final {
 		b0 |= finalBit
 	}
+
+	if len(c.compression) > 0 {
+		b0 |= compressionBit
+	}
+
 	b1 := byte(0)
 	if !c.isServer {
 		b1 |= maskBit
@@ -516,11 +529,22 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 		return err
 	}
 	w := wr.(messageWriter)
-	if _, err := w.write(true, data); err != nil {
+
+	// Handle compression if enabled
+	if len(c.compression) > 0 {
+		var cdata []byte
+		if cdata, err = c.compressMessage(data); err != nil {
+			return err
+		}
+		//fmt.Println("original", len(data), "compressed", len(cdata))
+		data = cdata
+	}
+
+	if _, err = w.write(true, data); err != nil {
 		return err
 	}
 	if c.writeSeq == w.seq {
-		if err := c.flushFrame(true, nil); err != nil {
+		if err = c.flushFrame(true, nil); err != nil {
 			return err
 		}
 	}
@@ -577,7 +601,17 @@ func (c *Conn) advanceFrame() (int, error) {
 	mask := b[1]&maskBit != 0
 	c.readRemaining = int64(b[1] & 0x7f)
 
-	if reserved != 0 {
+	switch reserved {
+	case 4:
+		if frameType == TextMessage {
+			frameType = CompressedTextMessage
+		} else if frameType == BinaryMessage {
+			frameType = CompressedBinaryMessage
+		}
+	case 0:
+		// No compression
+		break
+	default:
 		return noFrame, c.handleProtocolError("unexpected reserved bits " + strconv.Itoa(reserved))
 	}
 
@@ -589,7 +623,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		if !final {
 			return noFrame, c.handleProtocolError("control frame not final")
 		}
-	case TextMessage, BinaryMessage:
+	case TextMessage, BinaryMessage, CompressedTextMessage, CompressedBinaryMessage:
 		if !c.readFinal {
 			return noFrame, c.handleProtocolError("message start before final message frame")
 		}
@@ -633,7 +667,7 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	// 5. For text and binary messages, enforce read limit and return.
 
-	if frameType == continuationFrame || frameType == TextMessage || frameType == BinaryMessage {
+	if frameType == continuationFrame || isData(frameType) {
 
 		c.readLength += c.readRemaining
 		if c.readLimit > 0 && c.readLength > c.readLimit {
@@ -707,7 +741,7 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			c.readErr = hideTempErr(err)
 			break
 		}
-		if frameType == TextMessage || frameType == BinaryMessage {
+		if isData(frameType) {
 			return frameType, messageReader{c, c.readSeq}, nil
 		}
 	}
@@ -749,7 +783,7 @@ func (r messageReader) Read(b []byte) (int, error) {
 		switch {
 		case err != nil:
 			r.c.readErr = hideTempErr(err)
-		case frameType == TextMessage || frameType == BinaryMessage:
+		case isData(frameType):
 			r.c.readErr = errors.New("websocket: internal error, unexpected text or binary in Reader")
 		}
 	}
@@ -769,7 +803,26 @@ func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 	if err != nil {
 		return messageType, nil, err
 	}
-	p, err = ioutil.ReadAll(r)
+
+	if p, err = ioutil.ReadAll(r); err != nil {
+		return
+	}
+
+	if len(c.compression) > 0 {
+		var cdata []byte
+		if cdata, err = c.decompressMessage(p); err != nil {
+			return
+		}
+		p = cdata
+		// Change messageType as data has already been decompressed.
+		switch messageType {
+		case CompressedTextMessage:
+			messageType = TextMessage
+		case CompressedBinaryMessage:
+			messageType = BinaryMessage
+		}
+	}
+
 	return messageType, p, err
 }
 

@@ -38,6 +38,11 @@ type Upgrader struct {
 	// requested by the client.
 	Subprotocols []string
 
+	// Server supported extensions (e.g. permessage-deflate)
+	// Currently only 'permessage-deflate; server_no_context_takeover; client_no_context_takeover'
+	// is supported.  i.e. no deflate options at this time.
+	Extensions []string
+
 	// Error specifies the function for generating HTTP error responses. If Error
 	// is nil, then http.Error is used to generate the HTTP response.
 	Error func(w http.ResponseWriter, r *http.Request, status int, reason error)
@@ -83,6 +88,26 @@ func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header
 		}
 	} else if responseHeader != nil {
 		return responseHeader.Get("Sec-Websocket-Protocol")
+	}
+	return ""
+}
+
+// Check for compression support, select compression type and
+// return extension with server supported options.
+func (u *Upgrader) selectCompressionExtension(r *http.Request) string {
+	extensions := r.Header.Get("Sec-WebSocket-Extensions")
+
+	if len(extensions) > 0 && u.Extensions != nil && len(u.Extensions) > 0 {
+		extOpts := strings.Split(extensions, " ")
+		if len(extOpts) > 0 && strings.HasPrefix(extOpts[0], "permessage-") {
+			ext := strings.TrimSuffix(extOpts[0], ";")
+			// find and return extension with supported options.
+			for _, e := range u.Extensions {
+				if strings.HasPrefix(e, ext) {
+					return e
+				}
+			}
+		}
 	}
 	return ""
 }
@@ -147,6 +172,7 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 
 	c := newConn(netConn, true, u.ReadBufferSize, u.WriteBufferSize)
 	c.subprotocol = subprotocol
+	c.compression = u.selectCompressionExtension(r)
 
 	p := c.writeBuf[:0]
 	p = append(p, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "...)
@@ -175,8 +201,11 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 			p = append(p, "\r\n"...)
 		}
 	}
+	// Set the selected compression header if enabled.
+	if len(c.compression) > 0 {
+		p = append(p, "Sec-WebSocket-Extensions: "+c.compression+"\r\n"...)
+	}
 	p = append(p, "\r\n"...)
-
 	// Clear deadlines set by HTTP server.
 	netConn.SetDeadline(time.Time{})
 
