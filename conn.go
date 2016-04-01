@@ -355,7 +355,7 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 		b0 |= finalBit
 	}
 
-	if len(c.compression) > 0 {
+	if len(c.compression) > 0 && !isControl(c.writeFrameType) {
 		b0 |= compressionBit
 	}
 
@@ -531,7 +531,7 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 	w := wr.(messageWriter)
 
 	// Handle compression if enabled
-	if len(c.compression) > 0 {
+	if len(c.compression) > 0 && !isControl(messageType) {
 		var cdata []byte
 		if cdata, err = c.compressMessage(data); err != nil {
 			return err
