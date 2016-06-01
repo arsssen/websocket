@@ -6,6 +6,7 @@ package websocket
 
 import (
 	"bufio"
+	"compress/flate"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"math/rand"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -55,10 +57,6 @@ const (
 
 	// BinaryMessage denotes a binary data message.
 	BinaryMessage = 2
-
-	// Internally created types for compression.
-	CompressedTextMessage   = 3
-	CompressedBinaryMessage = 4
 
 	// CloseMessage denotes a close control message. The optional message
 	// payload contains a numeric code and text. Use the FormatCloseMessage
@@ -104,7 +102,66 @@ type CloseError struct {
 }
 
 func (e *CloseError) Error() string {
-	return "websocket: close " + strconv.Itoa(e.Code) + " " + e.Text
+	s := []byte("websocket: close ")
+	s = strconv.AppendInt(s, int64(e.Code), 10)
+	switch e.Code {
+	case CloseNormalClosure:
+		s = append(s, " (normal)"...)
+	case CloseGoingAway:
+		s = append(s, " (going away)"...)
+	case CloseProtocolError:
+		s = append(s, " (protocol error)"...)
+	case CloseUnsupportedData:
+		s = append(s, " (unsupported data)"...)
+	case CloseNoStatusReceived:
+		s = append(s, " (no status)"...)
+	case CloseAbnormalClosure:
+		s = append(s, " (abnormal closure)"...)
+	case CloseInvalidFramePayloadData:
+		s = append(s, " (invalid payload data)"...)
+	case ClosePolicyViolation:
+		s = append(s, " (policy violation)"...)
+	case CloseMessageTooBig:
+		s = append(s, " (message too big)"...)
+	case CloseMandatoryExtension:
+		s = append(s, " (mandatory extension missing)"...)
+	case CloseInternalServerErr:
+		s = append(s, " (internal server error)"...)
+	case CloseTLSHandshake:
+		s = append(s, " (TLS handshake error)"...)
+	}
+	if e.Text != "" {
+		s = append(s, ": "...)
+		s = append(s, e.Text...)
+	}
+	return string(s)
+}
+
+// IsCloseError returns boolean indicating whether the error is a *CloseError
+// with one of the specified codes.
+func IsCloseError(err error, codes ...int) bool {
+	if e, ok := err.(*CloseError); ok {
+		for _, code := range codes {
+			if e.Code == code {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// IsUnexpectedCloseError returns boolean indicating whether the error is a
+// *CloseError with a code not in the list of expected codes.
+func IsUnexpectedCloseError(err error, expectedCodes ...int) bool {
+	if e, ok := err.(*CloseError); ok {
+		for _, code := range expectedCodes {
+			if e.Code == code {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 var (
@@ -127,8 +184,7 @@ func isControl(frameType int) bool {
 }
 
 func isData(frameType int) bool {
-	return frameType == TextMessage || frameType == BinaryMessage ||
-		frameType == CompressedTextMessage || frameType == CompressedBinaryMessage
+	return frameType == TextMessage || frameType == BinaryMessage
 }
 
 func maskBytes(key [4]byte, pos int, b []byte) int {
@@ -150,21 +206,26 @@ type Conn struct {
 	isServer    bool
 	subprotocol string
 
-	compression string // type of compression. len > 0 means it's enabled
+	compressionNegotiated bool // negotiated compression based on handshake
 
 	// Write fields
 	mu        chan bool // used as mutex to protect write to conn and closeSent
 	closeSent bool      // true if close message was sent
 
 	// Message writer fields.
+	writeCompressionEnabled bool
+
 	writeErr       error
 	writeBuf       []byte // frame is constructed in this buffer.
 	writePos       int    // end of data in writeBuf.
 	writeFrameType int    // type of the current frame.
 	writeSeq       int    // incremented to invalidate message writers.
 	writeDeadline  time.Time
+	isWriting      bool // for best-effort concurrent write detection
 
 	// Read fields
+	readMessageCompressed bool
+
 	readErr       error
 	br            *bufio.Reader
 	readRemaining int64 // bytes remaining in current frame.
@@ -176,6 +237,7 @@ type Conn struct {
 	readMaskKey   [4]byte
 	handlePong    func(string) error
 	handlePing    func(string) error
+	readErrCount  int
 }
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int) *Conn {
@@ -225,6 +287,12 @@ func (c *Conn) RemoteAddr() net.Addr {
 }
 
 // Write methods
+
+// EnableWriteCompression enables and disables write compression of subsequent text and
+// binary messages.  This function is a noop if compression was not negotiated with the peer.
+func (c *Conn) EnableWriteCompression(enable bool) {
+	c.writeCompressionEnabled = enable
+}
 
 func (c *Conn) write(frameType int, deadline time.Time, bufs ...[]byte) error {
 	<-c.mu
@@ -316,9 +384,6 @@ func (c *Conn) WriteControl(messageType int, data []byte, deadline time.Time) er
 //
 // There can be at most one open writer on a connection. NextWriter closes the
 // previous writer if the application has not already done so.
-//
-// The NextWriter method and the writers returned from the method cannot be
-// accessed by more than one goroutine at a time.
 func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
 	if c.writeErr != nil {
 		return nil, c.writeErr
@@ -335,7 +400,15 @@ func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
 	}
 
 	c.writeFrameType = messageType
-	return messageWriter{c, c.writeSeq}, nil
+
+	var wc io.WriteCloser = messageWriter{c, c.writeSeq}
+
+	// Return compression writer on data frame
+	if c.compressionNegotiated && c.writeCompressionEnabled && isData(messageType) {
+		return NewFlateAdaptorWriter(wc, compressDeflateLevel)
+	}
+
+	return wc, nil
 }
 
 func (c *Conn) flushFrame(final bool, extra []byte) error {
@@ -355,7 +428,9 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 		b0 |= finalBit
 	}
 
-	if len(c.compression) > 0 && !isControl(c.writeFrameType) {
+	// Check compression and that it is not a continuation frame
+	// as those should not have compression bit set per RFC
+	if c.compressionNegotiated && c.writeCompressionEnabled && c.writeFrameType != continuationFrame {
 		b0 |= compressionBit
 	}
 
@@ -397,8 +472,21 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 		}
 	}
 
-	// Write the buffers to the connection.
+	// Write the buffers to the connection with best-effort detection of
+	// concurrent writes. See the concurrency section in the package
+	// documentation for more info.
+
+	if c.isWriting {
+		panic("concurrent write to websocket connection")
+	}
+	c.isWriting = true
+
 	c.writeErr = c.write(c.writeFrameType, c.writeDeadline, c.writeBuf[framePos:c.writePos], extra)
+
+	if !c.isWriting {
+		panic("concurrent write to websocket connection")
+	}
+	c.isWriting = false
 
 	// Setup for next frame.
 	c.writePos = maxFrameHeaderSize
@@ -528,26 +616,30 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 	if err != nil {
 		return err
 	}
-	w := wr.(messageWriter)
 
-	// Handle compression if enabled
-	if len(c.compression) > 0 && !isControl(messageType) {
-		var cdata []byte
-		if cdata, err = c.compressMessage(data); err != nil {
+	if c.compressionNegotiated && c.writeCompressionEnabled {
+
+		fw := wr.(*FlateAdaptorWriter)
+		if _, err = fw.Write(data); err != nil {
 			return err
 		}
-		//fmt.Println("original", len(data), "compressed", len(cdata))
-		data = cdata
-	}
+		return fw.Close()
 
-	if _, err = w.write(true, data); err != nil {
-		return err
-	}
-	if c.writeSeq == w.seq {
-		if err = c.flushFrame(true, nil); err != nil {
+	} else {
+
+		w := wr.(messageWriter)
+		if _, err = w.write(true, data); err != nil {
 			return err
 		}
+
+		// final flush
+		if c.writeSeq == w.seq {
+			if err = c.flushFrame(true, nil); err != nil {
+				return err
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -603,13 +695,13 @@ func (c *Conn) advanceFrame() (int, error) {
 
 	switch reserved {
 	case 4:
-		if frameType == TextMessage {
-			frameType = CompressedTextMessage
-		} else if frameType == BinaryMessage {
-			frameType = CompressedBinaryMessage
+		if !c.compressionNegotiated {
+			return noFrame, c.handleProtocolError("unexpected reserved bits " + strconv.Itoa(reserved))
 		}
+		// Only the first frame of a compressed message has the reserved bit set.
+		c.readMessageCompressed = true
+		break
 	case 0:
-		// No compression
 		break
 	default:
 		return noFrame, c.handleProtocolError("unexpected reserved bits " + strconv.Itoa(reserved))
@@ -623,7 +715,7 @@ func (c *Conn) advanceFrame() (int, error) {
 		if !final {
 			return noFrame, c.handleProtocolError("control frame not final")
 		}
-	case TextMessage, BinaryMessage, CompressedTextMessage, CompressedBinaryMessage:
+	case TextMessage, BinaryMessage:
 		if !c.readFinal {
 			return noFrame, c.handleProtocolError("message start before final message frame")
 		}
@@ -704,13 +796,15 @@ func (c *Conn) advanceFrame() (int, error) {
 			return noFrame, err
 		}
 	case CloseMessage:
-		c.WriteControl(CloseMessage, []byte{}, time.Now().Add(writeWait))
+		echoMessage := []byte{}
 		closeCode := CloseNoStatusReceived
 		closeText := ""
 		if len(payload) >= 2 {
+			echoMessage = payload[:2]
 			closeCode = int(binary.BigEndian.Uint16(payload))
 			closeText = string(payload[2:])
 		}
+		c.WriteControl(CloseMessage, echoMessage, time.Now().Add(writeWait))
 		return noFrame, &CloseError{Code: closeCode, Text: closeText}
 	}
 
@@ -728,9 +822,11 @@ func (c *Conn) handleProtocolError(message string) error {
 // There can be at most one open reader on a connection. NextReader discards
 // the previous message if the application has not already consumed it.
 //
-// The NextReader method and the readers returned from the method cannot be
-// accessed by more than one goroutine at a time.
-func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
+// Applications must break out of the application's read loop when this method
+// returns a non-nil error value. Errors returned from this method are
+// permanent. Once this method returns a non-nil error, all subsequent calls to
+// this method return the same error.
+func (c *Conn) NextReader() (int, io.Reader, error) {
 
 	c.readSeq++
 	c.readLength = 0
@@ -741,10 +837,25 @@ func (c *Conn) NextReader() (messageType int, r io.Reader, err error) {
 			c.readErr = hideTempErr(err)
 			break
 		}
+
 		if isData(frameType) {
-			return frameType, messageReader{c, c.readSeq}, nil
+			var r io.Reader = messageReader{c, c.readSeq}
+			if c.compressionNegotiated && c.readMessageCompressed {
+				// Append compression bytes to output on the final read
+				r = flate.NewReader(io.MultiReader(r, strings.NewReader("\x00\x00\xff\xff\x01\x00\x00\xff\xff")))
+			}
+			return frameType, r, nil
 		}
 	}
+
+	// Applications that do handle the error returned from this method spin in
+	// tight loop on connection failure. To help application developers detect
+	// this error, panic on repeated reads to the failed connection.
+	c.readErrCount++
+	if c.readErrCount >= 1000 {
+		panic("repeated read on failed websocket connection")
+	}
+
 	return noFrame, nil, c.readErr
 }
 
@@ -771,11 +882,19 @@ func (r messageReader) Read(b []byte) (int, error) {
 				r.c.readMaskPos = maskBytes(r.c.readMaskKey, r.c.readMaskPos, b[:n])
 			}
 			r.c.readRemaining -= int64(n)
+			if r.c.readRemaining > 0 && r.c.readErr == io.EOF {
+				r.c.readErr = errUnexpectedEOF
+			}
 			return n, r.c.readErr
 		}
 
 		if r.c.readFinal {
 			r.c.readSeq++
+			// Reset compression for the next frame
+			if r.c.compressionNegotiated && r.c.readMessageCompressed {
+				r.c.readMessageCompressed = false
+			}
+
 			return 0, io.EOF
 		}
 
@@ -803,26 +922,7 @@ func (c *Conn) ReadMessage() (messageType int, p []byte, err error) {
 	if err != nil {
 		return messageType, nil, err
 	}
-
-	if p, err = ioutil.ReadAll(r); err != nil {
-		return
-	}
-
-	if len(c.compression) > 0 {
-		var cdata []byte
-		if cdata, err = c.decompressMessage(p); err != nil {
-			return
-		}
-		p = cdata
-		// Change messageType as data has already been decompressed.
-		switch messageType {
-		case CompressedTextMessage:
-			messageType = TextMessage
-		case CompressedBinaryMessage:
-			messageType = BinaryMessage
-		}
-	}
-
+	p, err = ioutil.ReadAll(r)
 	return messageType, p, err
 }
 

@@ -7,6 +7,7 @@ package websocket
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -93,23 +94,29 @@ func (u *Upgrader) selectSubprotocol(r *http.Request, responseHeader http.Header
 }
 
 // Check for compression support, select compression type and
-// return extension with server supported options.
-func (u *Upgrader) selectCompressionExtension(r *http.Request) string {
+// return extension with server supported options along with
+// whether valid compression headers were found.
+func (u *Upgrader) selectCompressionExtension(r *http.Request) (string, bool, error) {
 	extensions := r.Header.Get("Sec-WebSocket-Extensions")
 
-	if len(extensions) > 0 && u.Extensions != nil && len(u.Extensions) > 0 {
+	if u.Extensions != nil && len(extensions) > 0 {
+
 		extOpts := strings.Split(extensions, " ")
-		if len(extOpts) > 0 && strings.HasPrefix(extOpts[0], "permessage-") {
+		if len(extOpts) > 0 && strings.HasPrefix(extOpts[0], "permessage-deflate") {
 			ext := strings.TrimSuffix(extOpts[0], ";")
-			// find and return extension with supported options.
+			// Find and return extension with supported options.
 			for _, e := range u.Extensions {
+				// Check if server supports supplied extension
 				if strings.HasPrefix(e, ext) {
-					return e
+					if e != CompressPermessageDeflate {
+						return "", false, fmt.Errorf("Compression options not supported: %s", e)
+					}
+					return e, true, nil
 				}
 			}
 		}
 	}
-	return ""
+	return "", false, nil
 }
 
 // Upgrade upgrades the HTTP server connection to the WebSocket protocol.
@@ -117,6 +124,9 @@ func (u *Upgrader) selectCompressionExtension(r *http.Request) string {
 // The responseHeader is included in the response to the client's upgrade
 // request. Use the responseHeader to specify cookies (Set-Cookie) and the
 // application negotiated subprotocol (Sec-Websocket-Protocol).
+//
+// If the upgrade fails, then Upgrade replies to the client with an HTTP error
+// response.
 func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeader http.Header) (*Conn, error) {
 	if r.Method != "GET" {
 		return u.returnError(w, r, http.StatusMethodNotAllowed, "websocket: method not GET")
@@ -172,7 +182,10 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 
 	c := newConn(netConn, true, u.ReadBufferSize, u.WriteBufferSize)
 	c.subprotocol = subprotocol
-	c.compression = u.selectCompressionExtension(r)
+	_, c.compressionNegotiated, err = u.selectCompressionExtension(r)
+	if err != nil {
+		return u.returnError(w, r, http.StatusInternalServerError, err.Error())
+	}
 
 	p := c.writeBuf[:0]
 	p = append(p, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "...)
@@ -202,10 +215,14 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		}
 	}
 	// Set the selected compression header if enabled.
-	if len(c.compression) > 0 {
-		p = append(p, "Sec-WebSocket-Extensions: "+c.compression+"\r\n"...)
+	if c.compressionNegotiated {
+		// Turn compression on by default
+		c.writeCompressionEnabled = true
+		p = append(p, "Sec-WebSocket-Extensions: "+CompressPermessageDeflate+"\r\n"...)
 	}
+
 	p = append(p, "\r\n"...)
+
 	// Clear deadlines set by HTTP server.
 	netConn.SetDeadline(time.Time{})
 
@@ -276,4 +293,11 @@ func Subprotocols(r *http.Request) []string {
 		protocols[i] = strings.TrimSpace(protocols[i])
 	}
 	return protocols
+}
+
+// IsWebSocketUpgrade returns true if the client requested upgrade to the
+// WebSocket protocol.
+func IsWebSocketUpgrade(r *http.Request) bool {
+	return tokenListContainsValue(r.Header, "Connection", "upgrade") &&
+		tokenListContainsValue(r.Header, "Upgrade", "websocket")
 }

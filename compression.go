@@ -1,78 +1,92 @@
 package websocket
 
 import (
-	"bytes"
+	//"bytes"
 	"compress/flate"
-	"fmt"
-	"io/ioutil"
-	"strings"
+	//"fmt"
+	"io"
 )
 
-func (c *Conn) compressMessage(p []byte) (out []byte, err error) {
-	compressionAlgo := strings.TrimSuffix(strings.Split(c.compression, " ")[0], ";")
-	switch compressionAlgo {
-	case "permessage-deflate":
-		out, err = compressMessageWithFlate(p)
-	default:
-		out, err = nil, fmt.Errorf("Compression not supported: '%s'", compressionAlgo)
+const (
+	// Supported compression algorithm and parameters.
+	CompressPermessageDeflate = "permessage-deflate; server_no_context_takeover; client_no_context_takeover"
+
+	// Deflate compression level
+	compressDeflateLevel int = 3
+)
+
+// Sits between a flate writer and the underlying writer i.e. messageWriter
+// Truncates last bytes of flate compresses message
+type FlateAdaptor struct {
+	last5bytes []byte
+	msgWriter  io.WriteCloser
+}
+
+func NewFlateAdaptor(w io.WriteCloser) *FlateAdaptor {
+	return &FlateAdaptor{
+		msgWriter:  w,
+		last5bytes: []byte{},
+	}
+}
+
+func (aw *FlateAdaptor) Write(p []byte) (n int, err error) {
+
+	t := append(aw.last5bytes, p...)
+
+	if len(t) > 4 {
+		aw.last5bytes = make([]byte, 5)
+		copy(aw.last5bytes, t[len(t)-5:])
+		_, err = aw.msgWriter.Write(t[:len(t)-5])
+	} else {
+		aw.last5bytes = make([]byte, len(t))
+		aw.last5bytes = t
+	}
+
+	n = len(p)
+	return
+}
+
+func (aw *FlateAdaptor) writeEndBlock() (int, error) {
+	var t []byte
+	if aw.last5bytes[4] != 0x00 {
+		t = append(aw.last5bytes, 0x00)
+	}
+
+	return aw.msgWriter.Write(t[:len(t)-5])
+}
+
+func (aw *FlateAdaptor) Close() (err error) {
+	if _, err = aw.writeEndBlock(); err == nil {
+		err = aw.msgWriter.Close()
 	}
 	return
 }
 
-func (c *Conn) decompressMessage(p []byte) (out []byte, err error) {
-	compressionAlgo := strings.TrimSuffix(strings.Split(c.compression, " ")[0], ";")
-	switch compressionAlgo {
-	case "permessage-deflate":
-		out, err = decompressFlateMessage(p)
-	default:
-		out, err = nil, fmt.Errorf("Compression not supported: '%s'", compressionAlgo)
+// FlateAdaptorWriter --> FlateAdaptor --> messageWriter
+type FlateAdaptorWriter struct {
+	flWriter  *flate.Writer
+	flAdaptor *FlateAdaptor
+}
+
+func NewFlateAdaptorWriter(msgWriter io.WriteCloser, level int) (faw *FlateAdaptorWriter, err error) {
+	faw = &FlateAdaptorWriter{
+		flAdaptor: NewFlateAdaptor(msgWriter),
+	}
+	faw.flWriter, err = flate.NewWriter(faw.flAdaptor, level)
+	return
+}
+
+func (faw *FlateAdaptorWriter) Write(p []byte) (c int, err error) {
+	if c, err = faw.flWriter.Write(p); err == nil {
+		err = faw.flWriter.Flush()
 	}
 	return
 }
 
-func decompressFlateMessage(p []byte) (out []byte, err error) {
-	d := append(p, 0x00, 0x00, 0xff, 0xff)
-	in := bytes.NewBuffer(d)
-	decompressor := flate.NewReader(in)
-	defer decompressor.Close()
-
-	out, err = ioutil.ReadAll(decompressor)
-	if err != nil {
-		if err.Error() != "unexpected EOF" {
-			return
-		} else {
-			err = nil
-			//fmt.Println("Fix 'unexpected EOF' on decompression!")
-		}
+func (faw *FlateAdaptorWriter) Close() (err error) {
+	if err = faw.flWriter.Close(); err == nil {
+		err = faw.flAdaptor.Close()
 	}
-	return
-}
-
-func compressMessageWithFlate(data []byte) (out []byte, err error) {
-	var (
-		buff = new(bytes.Buffer)
-		flt  *flate.Writer
-	)
-
-	if flt, err = flate.NewWriter(buff, 1); err != nil {
-		return
-	}
-	defer flt.Close()
-
-	if _, err = flt.Write(data); err != nil {
-		return
-	}
-
-	if err = flt.Flush(); err != nil {
-		return
-	}
-
-	out = buff.Bytes()
-	if out[len(out)-1] != 0x00 {
-		out = append(out, 0x00)
-	}
-
-	out = out[:len(out)-5]
 
 	return
 }
