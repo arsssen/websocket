@@ -238,7 +238,13 @@ type Conn struct {
 	handlePong    func(string) error
 	handlePing    func(string) error
 	readErrCount  int
+	compressionLevel int
 }
+
+func (c *Conn) SetCompressionLevel(level int) {
+	c.compressionLevel = level
+}
+
 
 func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int) *Conn {
 	mu := make(chan bool, 1)
@@ -260,6 +266,7 @@ func newConn(conn net.Conn, isServer bool, readBufferSize, writeBufferSize int) 
 		writeBuf:       make([]byte, writeBufferSize+maxFrameHeaderSize),
 		writeFrameType: noFrame,
 		writePos:       maxFrameHeaderSize,
+		compressionLevel: compressDeflateLevel,
 	}
 	c.SetPingHandler(nil)
 	c.SetPongHandler(nil)
@@ -405,7 +412,7 @@ func (c *Conn) NextWriter(messageType int) (io.WriteCloser, error) {
 
 	// Return compression writer on data frame
 	if c.compressionNegotiated && c.writeCompressionEnabled && isData(messageType) {
-		return NewFlateAdaptorWriter(wc, compressDeflateLevel)
+		return NewFlateAdaptorWriter(wc, c.compressionLevel)
 	}
 
 	return wc, nil
