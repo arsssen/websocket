@@ -430,7 +430,7 @@ func (c *Conn) flushFrame(final bool, extra []byte) error {
 
 	// Check compression and that it is not a continuation frame
 	// as those should not have compression bit set per RFC
-	if c.compressionNegotiated && c.writeCompressionEnabled && c.writeFrameType != continuationFrame {
+	if c.compressionNegotiated && c.writeCompressionEnabled && c.writeFrameType != continuationFrame && !isControl(c.writeFrameType) {
 		b0 |= compressionBit
 	}
 
